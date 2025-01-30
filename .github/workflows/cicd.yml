@@ -1,0 +1,735 @@
+name: Build and Canary Test
+
+on:
+  push:
+    tags:
+      - '*-alhena-dev'
+      - '*-alhena-prod-local' 
+      - '*-alhena-prod-aws'
+      - '*-alhena-demo'
+
+jobs:
+  parse-tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      docker_tag: ${{ steps.set-output.outputs.docker_tag }}  
+      latest_tag: ${{ steps.set-output.outputs.latest_tag }}
+      build_env: ${{ steps.set-output.outputs.build_env }} 
+      compose_file_name: ${{ steps.set-output.outputs.compose_file_name }}
+      environment: ${{ steps.set-output.outputs.environment }}
+      project: ${{ steps.set-output.outputs.project }}
+      docker_compose_path: ${{ steps.set-output.outputs.docker_compose_path }}
+      deployment_timestamp: ${{ steps.set-output.outputs.deployment_timestamp }}
+      enable_cache: ${{ steps.set-output.outputs.enable_cache }}
+      enable_vulnerability_scan: ${{ steps.set-output.outputs.enable_vulnerability_scan }}
+    steps:
+      - name: Extract Tag and Context
+        id: set-output
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          REPO=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f2)
+          DOCKER_REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+          # Default settings based on environment
+          case "$TAG_NAME" in
+            *-dev)
+              ENABLE_CACHE="false"
+              ENABLE_VULNERABILITY_SCAN="false"
+              ;;
+            *-demo)
+              ENABLE_CACHE="false"
+              ENABLE_VULNERABILITY_SCAN="false"
+              ;;
+            *)
+              ENABLE_CACHE="false"
+              ENABLE_VULNERABILITY_SCAN="true"
+              ;;
+          esac
+          
+          # Allow override through repository variables
+          ENABLE_CACHE="${ENABLE_CACHE:-${{ vars.ENABLE_CACHE }}}"
+          ENABLE_VULNERABILITY_SCAN="${ENABLE_VULNERABILITY_SCAN:-${{ vars.ENABLE_VULNERABILITY_SCAN }}}"
+
+          if [[ "$TAG_NAME" =~ ^.*-([^-]+)-(dev|prod-local|prod-aws|demo)$ ]]; then
+            PROJECT="${BASH_REMATCH[1]}"
+            ENV_TYPE="${BASH_REMATCH[2]}"
+          else
+            echo "Invalid tag format. Tag must match pattern: *-{project}-{environment}"
+            echo "Environment must be one of: dev, prod-local, prod-aws, demo" 
+            exit 1
+          fi
+
+          case "$ENV_TYPE" in
+            "dev")
+              BUILD_ENV="dev"
+              COMPOSE_FILE_NAME="docker-compose.dev.yml"
+              ENVIRONMENT="development"
+              ;;
+            "prod-local")
+              BUILD_ENV="prod-local"
+              COMPOSE_FILE_NAME="docker-compose.prod-local.yml" 
+              ENVIRONMENT="production-local"
+              ;;
+            "prod-aws")  
+              BUILD_ENV="prod-aws"
+              COMPOSE_FILE_NAME="docker-compose.prod-aws.yml"
+              ENVIRONMENT="production-aws"
+              ;;
+            "demo")
+              BUILD_ENV="demo"  
+              COMPOSE_FILE_NAME="docker-compose.demo.yml"
+              ENVIRONMENT="demo"
+              ;;
+          esac
+
+          case "$PROJECT" in
+            "alhena") 
+              DOCKER_COMPOSE_PATH="/disk4/alhena/"
+              ;;
+            *)
+              echo "Unsupported project: $PROJECT"
+              exit 1
+              ;;  
+          esac
+
+          {
+            echo "docker_tag=${DOCKER_REPO}:${TAG_NAME}"
+            echo "latest_tag=${DOCKER_REPO}:latest-${PROJECT}-${ENV_TYPE}"
+            echo "build_env=${BUILD_ENV}"
+            echo "compose_file_name=${COMPOSE_FILE_NAME}"  
+            echo "environment=${ENVIRONMENT}"
+            echo "project=${PROJECT}"
+            echo "docker_compose_path=${DOCKER_COMPOSE_PATH}"
+            echo "deployment_timestamp=${TIMESTAMP}"
+            echo "enable_cache=${ENABLE_CACHE}"
+            echo "enable_vulnerability_scan=${ENABLE_VULNERABILITY_SCAN}"
+          } >> $GITHUB_OUTPUT
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: parse-tag
+    steps:
+      - name: Check Out Code
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker Layers
+        if: needs.parse-tag.outputs.enable_cache == 'true'
+        id: cache-docker-layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-docker-${{ github.sha }}-${{ hashFiles('Dockerfile', '**/build/**') }}
+          restore-keys: |
+            ${{ runner.os }}-docker-
+
+      - name: Build and Push Docker Image
+        run: |
+          mkdir -p /tmp/.buildx-cache
+          docker buildx create --use --driver docker-container
+          
+          CACHE_OPTIONS=""
+          if [ "${{ needs.parse-tag.outputs.enable_cache }}" = "true" ]; then
+            CACHE_OPTIONS="--cache-from=type=local,src=/tmp/.buildx-cache --cache-to=type=local,dest=/tmp/.buildx-cache"
+          else
+            CACHE_OPTIONS="--no-cache"
+          fi
+
+          docker buildx build \
+            --platform linux/amd64 \
+            --build-arg ENV=${{ needs.parse-tag.outputs.build_env }} \
+            --build-arg BUILD_TIME=${{ needs.parse-tag.outputs.deployment_timestamp }} \
+            $CACHE_OPTIONS \
+            --push \
+            -t ${{ needs.parse-tag.outputs.docker_tag }} \
+            -t ${{ needs.parse-tag.outputs.latest_tag }} \
+            .
+
+
+      - name: Verify Curl in Built Image
+        run: |
+          docker run --rm ${{ needs.parse-tag.outputs.docker_tag }} curl --version
+          
+      - name: Run Trivy vulnerability scanner
+        if: needs.parse-tag.outputs.enable_vulnerability_scan == 'true'
+        id: trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.parse-tag.outputs.docker_tag }}
+          format: 'json'
+          output: 'trivy-results.json'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+        continue-on-error: true
+
+      - name: Process Trivy Results
+        if: needs.parse-tag.outputs.enable_vulnerability_scan == 'true'
+        id: process-trivy
+        run: |
+          if [ -f trivy-results.json ]; then
+            # Validate JSON format
+            if jq empty trivy-results.json 2>/dev/null; then
+              VULN_COUNT=$(jq '.Results[] | select(.Vulnerabilities != null) | .Vulnerabilities | length' trivy-results.json | awk '{sum += $1} END {print sum}')
+              VULN_COUNT=${VULN_COUNT:-0}
+              
+              VULN_DETAILS=$(jq -r '.Results[] | select(.Vulnerabilities != null) | .Vulnerabilities[] | "- \(.VulnerabilityID): \(.Title)"' trivy-results.json | head -n 5)
+              echo "vuln_count=$VULN_COUNT" >> $GITHUB_OUTPUT
+              echo "vuln_details<<EOF" >> $GITHUB_OUTPUT
+              echo "$VULN_DETAILS" >> $GITHUB_OUTPUT
+              echo "EOF" >> $GITHUB_OUTPUT
+            else
+              echo "Invalid JSON file format"
+              echo "vuln_count=0" >> $GITHUB_OUTPUT
+              echo "vuln_details=Error: Invalid scan results format" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "vuln_count=0" >> $GITHUB_OUTPUT
+            echo "vuln_details=No vulnerability scan results found" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check Vulnerability Threshold
+        if: needs.parse-tag.outputs.enable_vulnerability_scan == 'true' && steps.process-trivy.outputs.vuln_count > 10
+        run: |
+          echo "Too many vulnerabilities found: ${{ steps.process-trivy.outputs.vuln_count }}"
+          exit 1
+
+      - name: Send Build Status to Teams
+        uses: aliencube/microsoft-teams-actions@v0.8.0
+        continue-on-error: true
+        with:
+          webhook_uri: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          title: "Build Status: ${{ needs.parse-tag.outputs.environment }}"
+          summary: "Build Status for ${{ needs.parse-tag.outputs.environment }}"
+          text: |
+            **Environment**: ${{ needs.parse-tag.outputs.environment }}
+            **Build Status**: success
+            **Security Status**: ${{ needs.parse-tag.outputs.enable_vulnerability_scan == 'true' && format('Found {0} vulnerabilities', steps.process-trivy.outputs.vuln_count) || 'Vulnerability scanning disabled' }}
+            
+            ${{ needs.parse-tag.outputs.enable_vulnerability_scan == 'true' && format('**Top Vulnerabilities**:\n{0}', steps.process-trivy.outputs.vuln_details) || '' }}
+            
+            **Tag**: ${{ github.ref_name }}
+            **Timestamp**: ${{ needs.parse-tag.outputs.deployment_timestamp }}
+            **Cache Enabled**: ${{ needs.parse-tag.outputs.enable_cache }}
+          theme_color: "${{ steps.process-trivy.outputs.vuln_count == '0' && '00FF00' || 'FF0000' }}"
+
+  canary-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [parse-tag, build-and-push]
+    outputs:
+      canary_status: ${{ steps.canary-health-check.outputs.status }}
+    steps:
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc curl sshpass jq netcat-openbsd
+
+      - name: Create Test Environment Setup Script
+        run: |
+          cat << 'EOF' > setup_test.sh
+          #!/bin/bash
+          set -ex
+
+          # Get tag name from argument
+          TAG_NAME="${1}"
+
+          # Extract project and environment from tag
+          if [[ "$TAG_NAME" =~ ^.*-([^-]+)-(dev|prod-local|prod-aws|demo)$ ]]; then
+            PROJECT="${BASH_REMATCH[1]}"
+            ENV_TYPE="${BASH_REMATCH[2]}"
+          else
+            echo "Invalid tag format"
+            exit 1
+          fi
+
+          # Set base directory and ensure it exists
+          BASE_DIR="/disk4/${PROJECT}"
+          mkdir -p "${BASE_DIR}"
+          cd "${BASE_DIR}" || {
+            echo "Failed to change to ${BASE_DIR}"
+            exit 1
+          }
+
+          # Install yq if not present
+          if ! command -v yq &> /dev/null; then
+            sudo wget https://github.com/mikefarah/yq/releases/download/v4.40.5/yq_linux_amd64 -O /usr/local/bin/yq
+            sudo chmod +x /usr/local/bin/yq
+          fi
+
+          # Set compose file names based on environment
+          case "$ENV_TYPE" in
+            "dev")
+              COMPOSE_FILE="docker-compose.dev.yml"
+              TEST_COMPOSE="docker-compose.dev-test.yml"
+              ;;
+            "prod-local")
+              COMPOSE_FILE="docker-compose.prod-local.yml"
+              TEST_COMPOSE="docker-compose.prod-local-test.yml"
+              ;;
+            "prod-aws")
+              COMPOSE_FILE="docker-compose.prod-aws.yml"
+              TEST_COMPOSE="docker-compose.prod-aws-test.yml"
+              ;;
+            "demo")
+              COMPOSE_FILE="docker-compose.demo.yml"
+              TEST_COMPOSE="docker-compose.demo-test.yml"
+              ;;
+          esac
+
+          TEST_PROJECT_NAME="${PROJECT}-${ENV_TYPE}-test"
+
+          # Function to cleanup test environment
+          cleanup_test_environment() {
+            local test_compose="$1"
+            local project_name="$2"
+            
+            echo "Cleaning up existing test environment..."
+            if [ -f "$test_compose" ]; then
+              docker compose -f "$test_compose" --project-name "$project_name" down --remove-orphans --timeout 30
+              sleep 5  # Wait for resources to be fully released
+            fi
+            
+            # Clean up any leftover test containers with matching project prefix
+            ORPHANED_CONTAINERS=$(docker ps -a --filter "name=${PROJECT}-.*-test" -q)
+            if [ -n "$ORPHANED_CONTAINERS" ]; then
+              docker rm -f $ORPHANED_CONTAINERS || true
+            fi
+            
+            # Remove test files
+            rm -f "$test_compose"
+            rm -f "${project_name}_containers.txt"
+            rm -f "${project_name}_ports.txt"
+            rm -f "${project_name}_compose_file.txt"
+          }
+
+          # Cleanup existing environment
+          cleanup_test_environment "$TEST_COMPOSE" "$TEST_PROJECT_NAME"
+
+          # Verify compose file exists
+          if [ ! -f "$COMPOSE_FILE" ]; then
+            echo "Compose file not found: $COMPOSE_FILE"
+            exit 1
+          fi
+
+          # Copy and modify compose file
+          cp "$COMPOSE_FILE" "$TEST_COMPOSE"
+
+          # Remove log rotation service
+          yq e 'del(.services[] | select(.key | test("-log-rotation$")))' -i "$TEST_COMPOSE"
+
+          # Validate modified compose file
+          if ! yq e . "$TEST_COMPOSE" > /dev/null 2>&1; then
+            echo "Invalid YAML in modified compose file"
+            exit 1
+          fi
+
+          echo "Pulling containers..."
+          if ! docker compose -f "$TEST_COMPOSE" --project-name "$TEST_PROJECT_NAME" pull --quiet; then
+            echo "Failed to pull containers"
+            exit 1
+          fi
+
+          echo "Starting containers..."
+          if ! COMPOSE_HTTP_TIMEOUT=300 docker compose -f "$TEST_COMPOSE" --project-name "$TEST_PROJECT_NAME" up -d --wait; then
+            echo "Failed to start containers"
+            docker compose -f "$TEST_COMPOSE" --project-name "$TEST_PROJECT_NAME" logs
+            exit 1
+          fi
+
+          echo "$TEST_COMPOSE" > "${TEST_PROJECT_NAME}_compose_file.txt"
+
+      - name: Execute Test Environment Setup
+        id: setup-canary
+        run: |
+          # Create base directory and set permissions
+          sshpass -p "${{ secrets.DEPLOY_PASSWORD }}" ssh -o StrictHostKeyChecking=no \
+          "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER }}" << 'EOF'
+            echo "${{ secrets.DEPLOY_PASSWORD }}" | sudo -S mkdir -p /disk4/alhena
+            echo "${{ secrets.DEPLOY_PASSWORD }}" | sudo -S chown -R $USER:$USER /disk4/alhena
+            
+            if [ ! -d "/disk4/alhena" ] || [ "$(stat -c '%U' /disk4/alhena)" != "$USER" ]; then
+              echo "Failed to create or set permissions on directory"
+              exit 1
+            fi
+          EOF
+
+          # Copy setup script
+          sshpass -p "${{ secrets.DEPLOY_PASSWORD }}" scp -o StrictHostKeyChecking=no setup_test.sh \
+            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER }}:/disk4/alhena/"
+          
+          # Execute setup script
+          sshpass -p "${{ secrets.DEPLOY_PASSWORD }}" ssh -o StrictHostKeyChecking=no \
+          "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER }}" << 'EOF'
+            cd /disk4/alhena || exit 1
+            chmod +x setup_test.sh
+            ./setup_test.sh "${{ github.ref_name }}" 2>&1
+          EOF
+
+      - name: Check Test Service Stability
+        run: |
+          # First verify SSH connection and required files
+          echo "Verifying SSH connection and project setup..."
+          if ! sshpass -p "${{ secrets.DEPLOY_PASSWORD }}" ssh -o StrictHostKeyChecking=no \
+              "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER }}" "cd /disk4/alhena && ls"; then
+              echo "Failed to connect to deployment server"
+              exit 1
+          fi
+      
+          TEST_PROJECT_NAME="${{ needs.parse-tag.outputs.project }}-${{ needs.parse-tag.outputs.build_env }}-test"
+          echo "Setting up stability check for project: $TEST_PROJECT_NAME"
+      
+          # Verify compose file exists
+          if ! sshpass -p "${{ secrets.DEPLOY_PASSWORD }}" ssh -o StrictHostKeyChecking=no \
+              "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER }}" \
+              "cd /disk4/alhena && [ -f ${TEST_PROJECT_NAME}_compose_file.txt ]"; then
+              echo "Compose file not found: ${TEST_PROJECT_NAME}_compose_file.txt"
+              exit 1
+          fi
+      
+          # Main stability check loop
+          TIMEOUT=300
+          INTERVAL=10
+          echo "Starting stability check (timeout: ${TIMEOUT}s, interval: ${INTERVAL}s)"
+          
+          START_TIME=$(date +%s)
+          STABLE=false
+          
+          while [ $(($(date +%s) - START_TIME)) -lt $TIMEOUT ]; do
+              # Get container status with formatted output
+              CONTAINER_STATUS=$(sshpass -p "${{ secrets.DEPLOY_PASSWORD }}" ssh -o StrictHostKeyChecking=no \
+                  "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER }}" \
+                  "cd /disk4/alhena && docker compose -f \$(cat ${TEST_PROJECT_NAME}_compose_file.txt) --project-name $TEST_PROJECT_NAME ps --format '{{.Name}}\t{{.State}}'")
+              
+              if [ $? -ne 0 ]; then
+                  echo "Failed to get container status"
+                  sleep $INTERVAL
+                  continue
+              fi
+
+              # Debug output
+              echo "Raw container status:"
+              echo "$CONTAINER_STATUS"
+              echo "---"
+
+              # Count running containers - look for "running" instead of "Up"
+              RUNNING_COUNT=$(echo "$CONTAINER_STATUS" | grep -c "running" || true)
+              TOTAL_COUNT=$(echo "$CONTAINER_STATUS" | grep -v '^$' | wc -l)
+      
+              if [ $TOTAL_COUNT -eq 0 ]; then
+                  echo "No containers found for $TEST_PROJECT_NAME"
+                  sleep $INTERVAL
+                  continue
+              fi
+      
+              echo "Container status: $RUNNING_COUNT/$TOTAL_COUNT running"
+      
+              # Check if any containers are unhealthy
+              UNHEALTHY_COUNT=0
+              while IFS= read -r line; do
+                  # Only process non-empty lines and look for "running" instead of "Up"
+                  if [ -n "$line" ] && echo "$line" | grep -q "running" && ! echo "$line" | grep -q "(healthy)"; then
+                      # Since we're using formatted output, we should check if container is in a healthy state
+                      if echo "$line" | grep -q "unhealthy"; then
+                          UNHEALTHY_COUNT=$((UNHEALTHY_COUNT + 1))
+                          echo "Unhealthy container found: $line"
+                      fi
+                  fi
+              done <<< "$CONTAINER_STATUS"
+      
+              if [ $RUNNING_COUNT -eq $TOTAL_COUNT ] && [ $UNHEALTHY_COUNT -eq 0 ]; then
+                  echo "All containers are running and healthy"
+                  STABLE=true
+                  break
+              fi
+      
+              echo "Waiting for containers to stabilize ($(( ($(date +%s) - START_TIME) ))s elapsed)"
+              sleep $INTERVAL
+          done
+      
+          if [ "$STABLE" != "true" ]; then
+              echo "Timeout waiting for services to stabilize"
+              echo "Final container status:"
+              sshpass -p "${{ secrets.DEPLOY_PASSWORD }}" ssh -o StrictHostKeyChecking=no \
+                  "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER }}" \
+                  "cd /disk4/alhena && {
+                      echo '=== Container Status ===';
+                      docker compose -f \$(cat ${TEST_PROJECT_NAME}_compose_file.txt) --project-name $TEST_PROJECT_NAME ps;
+                      echo '=== Container Logs ===';
+                      docker compose -f \$(cat ${TEST_PROJECT_NAME}_compose_file.txt) --project-name $TEST_PROJECT_NAME logs;
+                  }"
+              exit 1
+          fi
+      
+      - name: Health Check
+        id: canary-health-check
+        run: |
+          TEST_PROJECT_NAME="${{ needs.parse-tag.outputs.project }}-${{ needs.parse-tag.outputs.build_env }}-test"
+          echo "Running health checks for test project: $TEST_PROJECT_NAME"
+          
+          sshpass -p "${{ secrets.DEPLOY_PASSWORD }}" ssh -o StrictHostKeyChecking=no \
+          "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER }}" << 'EOF'
+          TEST_PROJECT_NAME="${{ needs.parse-tag.outputs.project }}-${{ needs.parse-tag.outputs.build_env }}-test"
+          cd /disk4/alhena || exit 1
+          
+          # Initialize failure count
+          FAILURES=0
+          TOTAL_CHECKS=0
+          
+          # Check if ports file exists
+          if [ ! -f "${TEST_PROJECT_NAME}_ports.txt" ]; then
+              echo "Ports file not found: ${TEST_PROJECT_NAME}_ports.txt"
+              exit 1
+          fi
+          
+          while IFS= read -r PORT_MAP || [ -n "$PORT_MAP" ]; do
+              if [[ "$PORT_MAP" =~ ([0-9]+):([0-9]+) ]]; then
+                  HOST_PORT=${BASH_REMATCH[1]}
+                  CONTAINER_PORT=${BASH_REMATCH[2]}
+                  TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+                  
+                  echo "Checking health endpoint on port $HOST_PORT..."
+                  CHECK_PASSED=false
+                  
+                  for i in {1..3}; do
+                      if curl -sf --max-time 10 http://localhost:$HOST_PORT/health; then
+                          echo "Health check passed for port $HOST_PORT"
+                          CHECK_PASSED=true
+                          break
+                      else
+                          echo "Attempt $i failed for port $HOST_PORT"
+                          sleep 5
+                      fi
+                  done
+                  
+                  if [ "$CHECK_PASSED" = "false" ]; then
+                      echo "Health check failed for port $HOST_PORT after 3 attempts"
+                      FAILURES=$((FAILURES + 1))
+                      
+                      echo "Container status for failed health check:"
+                      docker compose -f "$(cat ${TEST_PROJECT_NAME}_compose_file.txt)" --project-name "$TEST_PROJECT_NAME" ps
+                      
+                      echo "Container logs for failed health check:"
+                      docker compose -f "$(cat ${TEST_PROJECT_NAME}_compose_file.txt)" --project-name "$TEST_PROJECT_NAME" logs
+                  fi
+              else
+                  echo "Invalid port mapping format: $PORT_MAP"
+              fi
+          done < "${TEST_PROJECT_NAME}_ports.txt"
+          
+          # Check if any checks were performed
+          if [ $TOTAL_CHECKS -eq 0 ]; then
+              echo "No health checks were performed"
+              exit 1
+          fi
+          
+          # Calculate failure percentage
+          FAILURE_PERCENTAGE=$((FAILURES * 100 / TOTAL_CHECKS))
+          echo "Health check summary: $FAILURES failed out of $TOTAL_CHECKS checks ($FAILURE_PERCENTAGE% failure rate)"
+          
+          if [ $FAILURES -gt 0 ]; then
+              exit 1
+          fi
+          
+          exit 0
+          EOF
+          
+          # Check the exit status of the SSH command
+          SSH_EXIT_CODE=$?
+          if [ $SSH_EXIT_CODE -eq 0 ]; then
+              echo "status=success" >> $GITHUB_OUTPUT
+          else
+              echo "SSH command failed with exit code: $SSH_EXIT_CODE"
+              echo "status=failure" >> $GITHUB_OUTPUT
+              exit 1
+          fi
+      
+      - name: Cleanup Test Environment
+        if: always()
+        continue-on-error: true
+        run: |
+          TEST_PROJECT_NAME="${{ needs.parse-tag.outputs.project }}-${{ needs.parse-tag.outputs.build_env }}-test"
+          echo "Cleaning up test project: $TEST_PROJECT_NAME"
+          
+          sshpass -p "${{ secrets.DEPLOY_PASSWORD }}" ssh -o StrictHostKeyChecking=no \
+          "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER }}" << EOF
+            cd /disk4/alhena || exit 1
+            if [ -f "${TEST_PROJECT_NAME}_compose_file.txt" ]; then
+              TEST_COMPOSE=\$(cat "${TEST_PROJECT_NAME}_compose_file.txt")
+              echo "Stopping test containers..."
+              docker compose -f "\$TEST_COMPOSE" --project-name "$TEST_PROJECT_NAME" down
+              
+              echo "Cleaning up test files..."
+              rm -f "\$TEST_COMPOSE"
+              rm -f "${TEST_PROJECT_NAME}_containers.txt"
+              rm -f "${TEST_PROJECT_NAME}_ports.txt"
+              rm -f "${TEST_PROJECT_NAME}_compose_file.txt"
+              rm -f setup_test.sh
+            fi
+          EOF
+      
+      - name: Send Canary Test Status to Teams
+        uses: aliencube/microsoft-teams-actions@v0.8.0
+        if: always()
+        continue-on-error: true
+        with:
+          webhook_uri: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          title: "Canary Test Status: ${{ needs.parse-tag.outputs.environment }}"
+          summary: "Canary Test Results for ${{ needs.parse-tag.outputs.environment }}"
+          text: |
+            **Environment**: ${{ needs.parse-tag.outputs.environment }}
+            **Project**: ${{ needs.parse-tag.outputs.project }}
+            **Test Status**: ${{ steps.canary-health-check.outputs.status }}
+            **Tag**: ${{ github.ref_name }}
+            **Timestamp**: ${{ needs.parse-tag.outputs.deployment_timestamp }}
+            
+            Detailed test results and logs are available in the GitHub Actions run.
+          theme_color: ${{ steps.canary-health-check.outputs.status == 'success' && '00FF00' || 'FF0000' }}
+            
+  deploy-main:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 
+    needs: [parse-tag, build-and-push, canary-test]
+    if: ${{ needs.canary-test.outputs.canary_status == 'success' }}
+    steps:
+      - name: Deploy Main Service  
+        id: deploy
+        run: |
+          sshpass -p "${{ secrets.DEPLOY_PASSWORD }}" ssh -o StrictHostKeyChecking=no \
+          "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER }}" << EOF
+            cd ${{ needs.parse-tag.outputs.docker_compose_path }}
+            
+            # Create backup with error handling
+            if ! cp ${{ needs.parse-tag.outputs.compose_file_name }} ${{ needs.parse-tag.outputs.compose_file_name }}.backup-${{ needs.parse-tag.outputs.deployment_timestamp }}; then
+              echo "Failed to create backup"
+              exit 1
+            fi
+            
+            if ! docker compose -f ${{ needs.parse-tag.outputs.compose_file_name }} pull; then
+              echo "Failed to pull new images"
+              exit 1
+            fi
+            
+            if ! docker compose -f ${{ needs.parse-tag.outputs.compose_file_name }} up -d; then
+              echo "Failed to start new containers"
+              exit 1
+            fi
+          EOF
+          
+      - name: Send Deployment Status to Teams
+        uses: aliencube/microsoft-teams-actions@v0.8.0
+        continue-on-error: true
+        with:  
+          webhook_uri: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          title: "Deployment Status: ${{ needs.parse-tag.outputs.environment }}"
+          summary: "Deployment Status for ${{ needs.parse-tag.outputs.environment }}"  
+          text: |
+            **Environment**: ${{ needs.parse-tag.outputs.environment }}
+            **Deployment Status**: success
+            **Tag**: ${{ github.ref_name }}
+            **Timestamp**: ${{ needs.parse-tag.outputs.deployment_timestamp }}
+          theme_color: "00FF00"
+
+  rollback:
+    runs-on: ubuntu-latest  
+    timeout-minutes: 15
+    needs: [parse-tag, deploy-main] 
+    if: ${{ failure() && needs.deploy-main.result == 'failure' }}
+    steps:
+      - name: Rollback to Previous State
+        run: |  
+          sshpass -p "${{ secrets.DEPLOY_PASSWORD }}" ssh -o StrictHostKeyChecking=no \
+          "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER }}" << EOF
+            cd ${{ needs.parse-tag.outputs.docker_compose_path }}
+            
+            # Find the most recent backup file with error handling
+            LATEST_BACKUP=\$(ls -t ${{ needs.parse-tag.outputs.compose_file_name }}.backup-* 2>/dev/null | head -n1)
+            
+            if [ -n "\$LATEST_BACKUP" ] && [ -f "\$LATEST_BACKUP" ]; then
+              # Check backup age with improved error handling
+              BACKUP_AGE=\$(( ($(date +%s 2>/dev/null || echo 0) - $(date +%s -r "\$LATEST_BACKUP" 2>/dev/null || echo 0))/60 ))
+              
+              if [ -z "\$BACKUP_AGE" ] || [ "\$BACKUP_AGE" -gt 60 ]; then
+                echo "Backup file is too old (\${BACKUP_AGE:-unknown} minutes) or age calculation failed"
+                exit 1
+              fi
+              
+              if ! docker compose -f ${{ needs.parse-tag.outputs.compose_file_name }} down; then
+                echo "Failed to stop current containers"
+                exit 1
+              fi
+              
+              if ! mv "\$LATEST_BACKUP" ${{ needs.parse-tag.outputs.compose_file_name }}; then
+                echo "Failed to restore backup file"
+                exit 1
+              fi
+              
+              if ! docker compose -f ${{ needs.parse-tag.outputs.compose_file_name }} up -d; then
+                echo "Failed to start containers from backup"
+                exit 1
+              fi
+            else
+              echo "No backup file found for rollback"
+              exit 1
+            fi
+          EOF
+
+      - name: Send Rollback Status to Teams  
+        uses: aliencube/microsoft-teams-actions@v0.8.0
+        continue-on-error: true
+        with:
+          webhook_uri: ${{ secrets.TEAMS_WEBHOOK_URL }}  
+          title: "Rollback Status: ${{ needs.parse-tag.outputs.environment }}"
+          summary: "Rollback Status for ${{ needs.parse-tag.outputs.environment }}"
+          text: |
+            **Environment**: ${{ needs.parse-tag.outputs.environment }}
+            **Rollback Status**: Restored to previous version
+            **Tag**: ${{ github.ref_name }}
+            **Timestamp**: ${{ needs.parse-tag.outputs.deployment_timestamp }}
+          theme_color: "FFFF00"
+
+  deployment-success:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [parse-tag, deploy-main]
+    if: ${{ needs.deploy-main.result == 'success' }} 
+    steps:
+      - name: Send Deployment Success to Teams
+        uses: aliencube/microsoft-teams-actions@v0.8.0
+        continue-on-error: true
+        with:
+          webhook_uri: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          title: "Deployment Successful: ${{ needs.parse-tag.outputs.environment }}"
+          summary: "Deployment completed successfully for ${{ needs.parse-tag.outputs.environment }}"
+          text: |  
+            **Environment**: ${{ needs.parse-tag.outputs.environment }}
+            **Deployment Status**: Successful
+            **Project**: ${{ needs.parse-tag.outputs.project }}
+            **Tag**: ${{ github.ref_name }}
+            **Timestamp**: ${{ needs.parse-tag.outputs.deployment_timestamp }}
+            
+            Deployment has been completed and all services are running.
+          theme_color: "00FF00"
+
+      - name: Cleanup Old Backup Files
+        if: success()
+        run: |
+          sshpass -p "${{ secrets.DEPLOY_PASSWORD }}" ssh -o StrictHostKeyChecking=no \
+          "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER }}" << EOF
+            cd ${{ needs.parse-tag.outputs.docker_compose_path }}
+            # Keep only the 5 most recent backups
+            ls -t ${{ needs.parse-tag.outputs.compose_file_name }}.backup-* 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null || true
+          EOF
